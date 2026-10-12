@@ -1,0 +1,9 @@
+# Conda environment for the Spotify lyrics widget.
+# ./install.sh creates it for you; manually: conda env create -f environment.yml
+name: lyrics-widget
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pygobject   # Python bindings for GTK (also brings in gobject-introspection)
+  - gtk3        # the GTK 3 toolkit and its typelibs
