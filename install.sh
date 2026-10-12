@@ -89,7 +89,8 @@ Exec="$conda_bin" run --no-capture-output -n $env_name python "$dest/lyrics_widg
 X-GNOME-Autostart-enabled=true
 EOF
     echo "Autostart enabled: the widget starts at your next login."
-    echo "Start it now with:  conda activate $env_name && python $dest/lyrics_widget.py &"
+    printf 'Start it now in the background with:\n  nohup "%s" run --no-capture-output -n "%s" python "%s/lyrics_widget.py" >/dev/null 2>&1 &\n' \
+        "$conda_bin" "$env_name" "$dest"
 else
     echo
     echo "One step left: log in to Spotify once (it asks for your Client ID and opens your browser):"

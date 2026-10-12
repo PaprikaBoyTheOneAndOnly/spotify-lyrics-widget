@@ -19,6 +19,7 @@ import webbrowser
 from collections import namedtuple
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from xml.sax.saxutils import escape as _xml_escape
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "spotify-lyrics-widget"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -34,6 +35,7 @@ LRCLIB_URL = "https://lrclib.net/api"
 USER_AGENT = "spotify-lyrics-widget/1.0 (personal desktop widget)"
 
 STATE_FILE = CONFIG_DIR / "state.json"   # remembers a Spotify "back off" across restarts
+PID_FILE = CONFIG_DIR / "widget.pid"     # lets `--settings` find the running widget
 
 POLL_PLAYING_SECONDS = 3.0   # how often Spotify is asked while a song plays (config: poll_seconds)
 POLL_IDLE_SECONDS = 6.0      # ...while paused / nothing playing
@@ -430,3 +432,139 @@ class Poller(threading.Thread):
                                      [ms for ms, _ in lines], now["duration_ms"],
                                      now["at"] + self.poll_seconds * 3 + 2)
         return self._playing_delay(now)
+
+
+# --------------------------------------------------------------------------- settings
+
+DEFAULT_SETTINGS = {
+    "bg_color": "#121212",       # window background
+    "bg_opacity": 0.72,          # 0 = fully transparent, 1 = solid
+    "text_color": "#ffffff",
+    "font_family": "",           # empty = system font
+    "font_size": 16,             # px; the current line is drawn larger automatically
+    "dim_opacity": 0.5,          # opacity of the lines before/after the current one
+    "radius": 18,                # corner radius, px
+    "width": 900,
+    "height": 240,
+    "lines_before": 1,
+    "lines_after": 2,
+    "poll_seconds": POLL_PLAYING_SECONDS,
+    "offset_ms": 0,              # positive = lines appear earlier
+    "keep_above": True,          # always on top
+}
+
+# key -> (min, max, type)
+_SETTING_LIMITS = {
+    "bg_opacity": (0.0, 1.0, float),
+    "dim_opacity": (0.1, 1.0, float),
+    "font_size": (8, 72, int),
+    "radius": (0, 60, int),
+    "width": (300, 2400, int),
+    "height": (80, 1200, int),
+    "lines_before": (0, 4, int),
+    "lines_after": (0, 6, int),
+    "poll_seconds": (1.0, 30.0, float),
+    "offset_ms": (-5000, 5000, int),
+}
+_HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _clamp_number(value, default, lo, hi, cast):
+    if isinstance(value, bool):
+        return default
+    try:
+        number = cast(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if number != number:  # NaN
+        return default
+    return max(lo, min(hi, number))
+
+
+def clean_settings(raw=None):
+    """Return a complete, validated settings dict: unknown keys are dropped, bad or
+    missing values fall back to the defaults, numbers are clamped to sane ranges."""
+    raw = raw if isinstance(raw, dict) else {}
+    out = {}
+    for key, default in DEFAULT_SETTINGS.items():
+        value = raw.get(key, default)
+        if key in ("bg_color", "text_color"):
+            out[key] = value if isinstance(value, str) and _HEX_COLOR.match(value) else default
+        elif key == "font_family":
+            out[key] = re.sub(r"[^\w .,\-()]", "", value)[:60].strip() if isinstance(value, str) else default
+        elif key == "keep_above":
+            out[key] = value if isinstance(value, bool) else default
+        else:
+            lo, hi, cast = _SETTING_LIMITS[key]
+            out[key] = _clamp_number(value, default, lo, hi, cast)
+    return out
+
+
+def load_settings():
+    return clean_settings(load_json(CONFIG_FILE, {}))
+
+
+def update_config(**changes):
+    """Read-modify-write config.json so keys written elsewhere (client_id, x, y) survive."""
+    cfg = load_json(CONFIG_FILE, {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    cfg.update(changes)
+    save_json(CONFIG_FILE, cfg)
+    return cfg
+
+
+def hex_to_rgb(color):
+    return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def build_css(s):
+    """GTK CSS for the lyrics window. Scoped by style class so it never touches other windows."""
+    r, g, b = hex_to_rgb(s["bg_color"])
+    family = f'font-family: "{s["font_family"]}";' if s["font_family"] else ""
+    return (
+        f"window.lyrics-window {{ background-image: none; background-color: rgba({r}, {g}, {b}, {s['bg_opacity']:.2f}); "
+        f"border-radius: {s['radius']}px; }}\n"
+        f"label.lyrics-text {{ color: {s['text_color']}; font-size: {s['font_size']}px; "
+        f"padding: 16px 32px; {family} }}\n"
+    )
+
+
+def render_markup(lines, idx, before=1, after=2, dim=0.5):
+    """Pango markup: `before` dimmed lines, the current line (big, bold), `after` dimmed lines.
+    idx == -1 means the song has not reached its first line yet."""
+    alpha = f"{round(dim * 100)}%"
+
+    def esc(text):
+        return _xml_escape(text) if text else "♪"  # empty line -> music note
+
+    parts = [f'<span alpha="{alpha}">{esc(lines[i][1])}</span>' for i in range(max(0, idx - before), idx)]
+    current = lines[idx][1] if idx >= 0 else ""
+    parts.append(f'<span size="xx-large" weight="bold">{esc(current)}</span>')
+    parts.extend(f'<span alpha="{alpha}">{esc(text)}</span>' for _, text in lines[idx + 1: idx + 1 + after])
+    return "\n".join(parts)
+
+
+# --------------------------------------------------------------------------- running-instance helpers
+
+def write_pid_file():
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()))
+
+
+def remove_pid_file():
+    try:
+        if PID_FILE.read_text().strip() == str(os.getpid()):
+            PID_FILE.unlink()
+    except OSError:
+        pass
+
+
+def find_running_widget(needle=b"lyrics_widget"):
+    """PID of a running widget (from the pid file, double-checked against /proc), or None."""
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (OSError, ValueError):
+        return None
+    return pid if needle in cmdline else None
