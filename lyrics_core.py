@@ -276,7 +276,9 @@ def fetch_lyrics(track):
             "album_name": track["album"],
             "duration": duration_s,
         }))
-        best = _pick([rec], duration_s)
+
+        if rec is not None and rec.get("syncedLyrics"):
+            best = _pick([rec], duration_s)
     except HttpError as e:
         if e.status != 404:
             raise
