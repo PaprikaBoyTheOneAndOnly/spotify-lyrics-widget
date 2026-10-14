@@ -14,8 +14,8 @@ import signal
 import sys
 import threading
 
-# GNOME on Wayland ignores "always on top" and window positioning for normal apps;
-# XWayland honours both. Override with GDK_BACKEND=wayland if you prefer.
+# # GNOME on Wayland ignores "always on top" and window positioning for normal apps;
+# # XWayland honours both. Override with GDK_BACKEND=wayland if you prefer.
 os.environ.setdefault("GDK_BACKEND", "x11")
 
 import gi
@@ -298,7 +298,15 @@ class LyricsWindow(Gtk.Window):
         self.label.set_justify(Gtk.Justification.CENTER)
         self.label.set_line_wrap(True)
         self.label.set_max_width_chars(60)
-        self.add(self.label)
+
+        # Small "Title - Artist" caption in the top-left corner, on top of the lyrics.
+        self.title_label = Gtk.Label(halign=Gtk.Align.START, valign=Gtk.Align.START)
+        self.title_label.get_style_context().add_class("lyrics-title")
+        self.title_label.set_max_width_chars(40)
+        overlay = Gtk.Overlay()
+        overlay.add(self.label)
+        overlay.add_overlay(self.title_label)
+        self.add(overlay)
 
         cfg = load_json(CONFIG_FILE, {})
         self.pos = (cfg["x"], cfg["y"]) if "x" in cfg and "y" in cfg else self._default_pos()
@@ -392,8 +400,10 @@ class LyricsWindow(Gtk.Window):
         idx = locate(snap, s["offset_ms"])  # None = paused / stale / song over -> show nothing
         if idx is not None:
             lines, key = snap.lines, (snap.track_id, idx)
+            caption = f"{snap.title} - {snap.artist}" if snap.artist else snap.title
         elif self.preview:
             lines, idx, key = SAMPLE_LINES, SAMPLE_INDEX, ("sample", SAMPLE_INDEX)
+            caption = "Song title - Artist"
         else:
             if self.get_visible():
                 self.hide()
@@ -402,6 +412,7 @@ class LyricsWindow(Gtk.Window):
 
         if key != self._shown_key:
             self.label.set_markup(render_markup(lines, idx, s["lines_before"], s["lines_after"], s["dim_opacity"]))
+            self.title_label.set_text(caption)
             self._shown_key = key
         if not self.get_visible():
             self.move(*self.pos)

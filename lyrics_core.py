@@ -34,12 +34,12 @@ API_URL = "https://api.spotify.com/v1"
 LRCLIB_URL = "https://lrclib.net/api"
 USER_AGENT = "spotify-lyrics-widget/1.0 (personal desktop widget)"
 
-STATE_FILE = CONFIG_DIR / "state.json"   # remembers a Spotify "back off" across restarts
-PID_FILE = CONFIG_DIR / "widget.pid"     # lets `--settings` find the running widget
+STATE_FILE = CONFIG_DIR / "state.json"  # remembers a Spotify "back off" across restarts
+PID_FILE = CONFIG_DIR / "widget.pid"  # lets `--settings` find the running widget
 
-POLL_PLAYING_SECONDS = 3.0   # how often Spotify is asked while a song plays (config: poll_seconds)
-POLL_IDLE_SECONDS = 6.0      # ...while paused / nothing playing
-MAX_DURATION_DIFF = 5        # seconds; reject lyrics for a clearly different version
+POLL_PLAYING_SECONDS = 3.0  # how often Spotify is asked while a song plays (config: poll_seconds)
+POLL_IDLE_SECONDS = 6.0  # ...while paused / nothing playing
+MAX_DURATION_DIFF = 5  # seconds; reject lyrics for a clearly different version
 
 log = logging.getLogger("lyrics")
 
@@ -163,7 +163,8 @@ class Spotify:
 
     def _refresh(self):
         if not self.logged_in:
-            raise NeedLogin("Not logged in to Spotify. Run (in the lyrics-widget conda env): python lyrics_widget.py --login")
+            raise NeedLogin(
+                "Not logged in to Spotify. Run (in the lyrics-widget conda env): python lyrics_widget.py --login")
         try:
             resp = http("POST", TOKEN_URL, form={
                 "grant_type": "refresh_token",
@@ -172,7 +173,8 @@ class Spotify:
             })
         except HttpError as e:
             if e.status in (400, 401):
-                raise NeedLogin("Spotify login expired. Run (in the lyrics-widget conda env): python lyrics_widget.py --login") from None
+                raise NeedLogin(
+                    "Spotify login expired. Run (in the lyrics-widget conda env): python lyrics_widget.py --login") from None
             raise
         self._store(resp)
 
@@ -241,8 +243,8 @@ def _estimate_timing(plain, duration_ms):
 
 
 def _clean_title(title):
-    title = re.sub(r"\s+-\s+.*$", "", title)                 # " - Remastered 2011", " - Live"
-    title = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", title)    # "(feat. X)", "[Deluxe]"
+    title = re.sub(r"\s+-\s+.*$", "", title)  # " - Remastered 2011", " - Live"
+    title = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", title)  # "(feat. X)", "[Deluxe]"
     return title.strip() or title
 
 
@@ -309,7 +311,7 @@ def fetch_lyrics(track):
 
 # --------------------------------------------------------------------------- poller
 
-Snapshot = namedtuple("Snapshot", "track_id progress_ms at lines starts duration_ms expires")
+Snapshot = namedtuple("Snapshot", "track_id progress_ms at lines starts duration_ms expires title artist")
 
 
 def locate(snap, offset_ms=0, now=None):
@@ -345,8 +347,8 @@ class Poller(threading.Thread):
         self.spotify = spotify
         self.poll_seconds = max(1.0, float(poll_seconds))
         self.snapshot = None
-        self.fatal = None      # message if the widget must quit (e.g. login revoked)
-        self._cache = {}       # track id -> lines, or None if the song has no lyrics
+        self.fatal = None  # message if the widget must quit (e.g. login revoked)
+        self._cache = {}  # track id -> lines, or None if the song has no lyrics
 
     def run(self):
         wait = self._blocked_remaining()
@@ -358,7 +360,7 @@ class Poller(threading.Thread):
             try:
                 now = self.spotify.now_playing()
                 log.debug("poll: %s", {k: now[k] for k in ("title", "is_playing", "progress_ms")}
-                          if now else "nothing playing")
+                if now else "nothing playing")
                 delay = self._update(now)
                 failures = 0
             except NeedLogin as e:
@@ -432,27 +434,28 @@ class Poller(threading.Thread):
             # `expires`: if no fresh answer from Spotify arrives in time, stop showing lyrics
             self.snapshot = Snapshot(tid, now["progress_ms"], now["at"], lines,
                                      [ms for ms, _ in lines], now["duration_ms"],
-                                     now["at"] + self.poll_seconds * 3 + 2)
+                                     now["at"] + self.poll_seconds * 3 + 2,
+                                     now["title"], now["artist"])
         return self._playing_delay(now)
 
 
 # --------------------------------------------------------------------------- settings
 
 DEFAULT_SETTINGS = {
-    "bg_color": "#121212",       # window background
-    "bg_opacity": 0.72,          # 0 = fully transparent, 1 = solid
+    "bg_color": "#121212",  # window background
+    "bg_opacity": 0.72,  # 0 = fully transparent, 1 = solid
     "text_color": "#ffffff",
-    "font_family": "",           # empty = system font
-    "font_size": 16,             # px; the current line is drawn larger automatically
-    "dim_opacity": 0.5,          # opacity of the lines before/after the current one
-    "radius": 18,                # corner radius, px
+    "font_family": "",  # empty = system font
+    "font_size": 16,  # px; the current line is drawn larger automatically
+    "dim_opacity": 0.5,  # opacity of the lines before/after the current one
+    "radius": 18,  # corner radius, px
     "width": 900,
     "height": 240,
     "lines_before": 1,
     "lines_after": 2,
     "poll_seconds": POLL_PLAYING_SECONDS,
-    "offset_ms": 0,              # positive = lines appear earlier
-    "keep_above": True,          # always on top
+    "offset_ms": 0,  # positive = lines appear earlier
+    "keep_above": True,  # always on top
 }
 
 # key -> (min, max, type)
@@ -529,6 +532,8 @@ def build_css(s):
         f"border-radius: {s['radius']}px; }}\n"
         f"label.lyrics-text {{ color: {s['text_color']}; font-size: {s['font_size']}px; "
         f"padding: 16px 32px; {family} }}\n"
+        f"label.lyrics-title {{ color: {s['text_color']}; font-size: 12px; opacity: 0.6; "
+        f"padding: 8px 14px; {family} }}\n"
     )
 
 
