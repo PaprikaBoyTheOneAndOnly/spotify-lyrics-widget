@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs the widget on Ubuntu:
+# Installs the widget on Linux (GTK UI; see install.ps1 for Windows):
 #   1. creates (or updates) the conda environment "lyrics-widget" from environment.yml
 #   2. copies the widget to ~/.local/share/spotify-lyrics-widget
 #   3. starts it automatically at login (once you have logged in to Spotify)
@@ -74,8 +74,9 @@ fi
 
 # 2. the widget itself
 mkdir -p "$dest" "$autostart"
-cp "$here/lyrics_core.py" "$here/lyrics_widget.py" "$dest/"
-chmod +x "$dest/lyrics_widget.py"
+rm -f "$dest/lyrics_widget.py"  # old name of lyrics_widget_linux.py
+cp "$here/lyrics_core.py" "$here/lyrics_widget_linux.py" "$dest/"
+chmod +x "$dest/lyrics_widget_linux.py"
 echo "Copied the widget to $dest"
 
 # 3. autostart (only once the Spotify login exists: an autostarted widget has no terminal to ask in)
@@ -85,16 +86,16 @@ if [ -f "$HOME/.config/spotify-lyrics-widget/token.json" ]; then
 Type=Application
 Name=Spotify Lyrics Widget
 Comment=Shows lyrics of the song playing on Spotify
-Exec="$conda_bin" run --no-capture-output -n $env_name python "$dest/lyrics_widget.py"
+Exec="$conda_bin" run --no-capture-output -n $env_name python "$dest/lyrics_widget_linux.py"
 X-GNOME-Autostart-enabled=true
 EOF
     echo "Autostart enabled: the widget starts at your next login."
-    printf 'Start it now in the background with:\n  nohup "%s" run --no-capture-output -n "%s" python "%s/lyrics_widget.py" >/dev/null 2>&1 &\n' \
+    printf 'Start it now in the background with:\n  nohup "%s" run --no-capture-output -n "%s" python "%s/lyrics_widget_linux.py" >/dev/null 2>&1 &\n' \
         "$conda_bin" "$env_name" "$dest"
 else
     echo
     echo "One step left: log in to Spotify once (it asks for your Client ID and opens your browser):"
     echo "  conda activate $env_name"
-    echo "  python $dest/lyrics_widget.py"
+    echo "  python $dest/lyrics_widget_linux.py"
     echo "Then run ./install.sh again to enable autostart."
 fi

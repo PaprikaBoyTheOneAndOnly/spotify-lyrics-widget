@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
-"""Spotify lyrics widget for Ubuntu.
+"""Spotify lyrics widget, GTK 3 UI for Linux.
 
 A small borderless window that shows the lyrics of whatever Spotify is currently
 playing (on any device) and hides itself when nothing is playing.
 Right-click it -> Settings for colours, font, size, polling, re-login ...
+All the logic lives in lyrics_core.py; this file only draws it.
 """
 
-import argparse
-import atexit
 import logging
 import os
-import signal
 import sys
 import threading
+from xml.sax.saxutils import escape as xml_escape
 
-# # GNOME on Wayland ignores "always on top" and window positioning for normal apps;
-# # XWayland honours both. Override with GDK_BACKEND=wayland if you prefer.
+# GNOME on Wayland ignores "always on top" and window positioning for normal apps;
+# XWayland honours both. Override with GDK_BACKEND=wayland if you prefer.
 os.environ.setdefault("GDK_BACKEND", "x11")
 
 import gi
@@ -24,45 +23,39 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
-from lyrics_core import (CONFIG_FILE, Poller, Spotify, build_css, clean_settings,  # noqa: E402
-                         find_running_widget, load_json, load_settings, locate,
-                         remove_pid_file, render_markup, update_config, write_pid_file)
+import lyrics_core as core  # noqa: E402
+from lyrics_core import (SETTINGS_LAYOUT, build_view, clean_settings, load_json,  # noqa: E402
+                         load_settings, update_config)
 
-SETUP_HELP = """
-First-time setup: you need a (free) Spotify developer app.
-  1. Go to https://developer.spotify.com/dashboard and create an app.
-  2. Add this Redirect URI:  http://127.0.0.1:8888/callback
-  3. Tick "Web API", save, then copy the Client ID from the app's settings.
-"""
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                          "spotify-lyrics-widget")
 
-# Shown while the settings window is open and no song with lyrics is playing.
-SAMPLE_LINES = [(i * 1000, text) for i, text in enumerate([
-    "Earlier line", "Earlier line", "Earlier line", "Previous line",
-    "This is the current line",
-    "Next line", "Line after that", "Another line", "Another line", "Another line", "Last line",
-])]
-SAMPLE_INDEX = 4
 
-# Rows of the settings window: (key, label, kind, options); 1-tuples are section headings.
-LAYOUT = [
-    ("Appearance",),
-    ("bg_color", "Background color", "color", {}),
-    ("bg_opacity", "Background opacity (%)", "percent", {"lo": 0, "hi": 100}),
-    ("text_color", "Text color", "color", {}),
-    ("font_family", "Font", "font", {}),
-    ("font_size", "Font size (px)", "spin", {"lo": 8, "hi": 72, "step": 1}),
-    ("dim_opacity", "Other lines opacity (%)", "percent", {"lo": 10, "hi": 100}),
-    ("radius", "Corner radius (px)", "spin", {"lo": 0, "hi": 60, "step": 1}),
-    ("Layout",),
-    ("width", "Width (px)", "spin", {"lo": 300, "hi": 2400, "step": 10}),
-    ("height", "Height (px)", "spin", {"lo": 80, "hi": 1200, "step": 10}),
-    ("lines_before", "Lines before current", "spin", {"lo": 0, "hi": 4, "step": 1}),
-    ("lines_after", "Lines after current", "spin", {"lo": 0, "hi": 6, "step": 1}),
-    ("keep_above", "Always on top", "check", {}),
-    ("Timing",),
-    ("poll_seconds", "Ask Spotify every (s)", "spin", {"lo": 1, "hi": 30, "step": 0.5, "digits": 1}),
-    ("offset_ms", "Lyrics timing offset (ms)", "spin", {"lo": -5000, "hi": 5000, "step": 50}),
-]
+def hex_to_rgb(color):
+    return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def build_css(s):
+    """GTK CSS for the lyrics window. Scoped by style class so it never touches other windows."""
+    r, g, b = hex_to_rgb(s["bg_color"])
+    family = f'font-family: "{s["font_family"]}";' if s["font_family"] else ""
+    return (
+        f"window.lyrics-window {{ background-image: none; background-color: rgba({r}, {g}, {b}, {s['bg_opacity']:.2f}); "
+        f"border-radius: {s['radius']}px; }}\n"
+        f"label.lyrics-text {{ color: {s['text_color']}; font-size: {s['font_size']}px; "
+        f"padding: 16px 32px; {family} }}\n"
+        f"label.lyrics-title {{ color: {s['text_color']}; font-size: 12px; opacity: 0.6; "
+        f"padding: 8px 14px; {family} }}\n"
+    )
+
+
+def render_markup(rows, dim):
+    """Pango markup: dimmed context lines around the current one (big, bold)."""
+    alpha = f"{round(dim * 100)}%"
+    return "\n".join(
+        f'<span size="xx-large" weight="bold">{xml_escape(text)}</span>' if current
+        else f'<span alpha="{alpha}">{xml_escape(text)}</span>'
+        for text, current in rows)
 
 
 def rgba_to_hex(rgba):
@@ -94,7 +87,7 @@ class SettingsWindow(Gtk.Window):
         self.add(grid)
 
         row = 0
-        for item in LAYOUT:
+        for item in SETTINGS_LAYOUT:
             if len(item) == 1:
                 heading = Gtk.Label(xalign=0)
                 heading.set_markup(f"<b>{item[0]}</b>")
@@ -215,7 +208,7 @@ class SettingsWindow(Gtk.Window):
             GLib.source_remove(self._save_id)
             self._save_now()
         client_id = self.client_entry.get_text().strip()
-        if client_id and client_id != (load_json(CONFIG_FILE, {}).get("client_id") or ""):
+        if client_id and client_id != (load_json(core.CONFIG_FILE, {}).get("client_id") or ""):
             update_config(client_id=client_id)  # used from the next start / next login
 
     def _on_reset(self, *_):
@@ -308,7 +301,7 @@ class LyricsWindow(Gtk.Window):
         overlay.add_overlay(self.title_label)
         self.add(overlay)
 
-        cfg = load_json(CONFIG_FILE, {})
+        cfg = load_json(core.CONFIG_FILE, {})
         self.pos = (cfg["x"], cfg["y"]) if "x" in cfg and "y" in cfg else self._default_pos()
         self.apply_settings(self.settings)
 
@@ -355,11 +348,6 @@ class LyricsWindow(Gtk.Window):
         self.preview = False
         self._shown_key = None
 
-    def on_signal(self):
-        """SIGUSR1 (sent by `lyrics_widget.py --settings`) opens the settings window."""
-        self.open_settings()
-        return GLib.SOURCE_CONTINUE
-
     # -- placement ----------------------------------------------------------------
     def _default_pos(self):
         display = Gdk.Display.get_default()
@@ -391,29 +379,23 @@ class LyricsWindow(Gtk.Window):
     # -- main tick ----------------------------------------------------------------
     def _tick(self):
         if self.poller.fatal:
+            logging.getLogger("lyrics").error(self.poller.fatal)
             print(self.poller.fatal, file=sys.stderr)
             Gtk.main_quit()
             return False
 
         s = self.settings
-        snap = self.poller.snapshot
-        idx = locate(snap, s["offset_ms"])  # None = paused / stale / song over -> show nothing
-        if idx is not None:
-            lines, key = snap.lines, (snap.track_id, idx)
-            caption = f"{snap.title} - {snap.artist}" if snap.artist else snap.title
-        elif self.preview:
-            lines, idx, key = SAMPLE_LINES, SAMPLE_INDEX, ("sample", SAMPLE_INDEX)
-            caption = "Song title - Artist"
-        else:
+        view = build_view(self.poller.snapshot, s, self.preview)
+        if view is None:
             if self.get_visible():
                 self.hide()
                 self._shown_key = None
             return True
 
-        if key != self._shown_key:
-            self.label.set_markup(render_markup(lines, idx, s["lines_before"], s["lines_after"], s["dim_opacity"]))
-            self.title_label.set_text(caption)
-            self._shown_key = key
+        if view.key != self._shown_key:
+            self.label.set_markup(render_markup(view.rows, s["dim_opacity"]))
+            self.title_label.set_text(view.caption)
+            self._shown_key = view.key
         if not self.get_visible():
             self.move(*self.pos)
             self.show_all()
@@ -421,52 +403,28 @@ class LyricsWindow(Gtk.Window):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Spotify lyrics widget")
-    parser.add_argument("--login", action="store_true", help="(re)do the Spotify login")
-    parser.add_argument("--settings", action="store_true",
-                        help="open the settings window (in the running widget, or start one)")
-    parser.add_argument("--debug", action="store_true", help="log every Spotify poll to the terminal")
-    args = parser.parse_args()
+    args = core.parse_args()
+    core.init(CONFIG_DIR)
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
-    if args.settings:
-        running = find_running_widget()
-        if running and running != os.getpid():
-            os.kill(running, signal.SIGUSR1)
-            print("Opened the settings in the running widget.")
-            return
+    if args.settings and core.send_command("settings"):
+        print("Opened the settings in the running widget.")
+        return
+    server = core.ControlServer()
+    if not server.bind():
+        sys.exit(f"Port {core.CONTROL_PORT} is in use: is the widget already running?")
+    server.start()
 
-    interactive = sys.stdin.isatty()
-    cfg = load_json(CONFIG_FILE, {})
-    client_id = os.environ.get("SPOTIFY_CLIENT_ID") or cfg.get("client_id")
-    if not client_id:
-        if not interactive:
-            sys.exit("No Spotify Client ID yet. Run the widget once from a terminal to set it up.")
-        print(SETUP_HELP)
-        client_id = input("Paste your Spotify Client ID: ").strip()
-        if not client_id:
-            sys.exit("No Client ID given.")
-        update_config(client_id=client_id)
+    spotify = core.setup_spotify(args)
 
-    spotify = Spotify(client_id)
-    if args.login or not spotify.logged_in:
-        if not interactive:
-            sys.exit("Not logged in to Spotify. Run the widget once from a terminal to log in.")
-        spotify.login()
-        print("Login OK. Starting the widget (right-click it for settings or to quit, drag to move).")
-
+    import signal
     signal.signal(signal.SIGINT, signal.SIG_DFL)  # let Ctrl+C work while GTK is running
-    poller = Poller(spotify, load_settings()["poll_seconds"])
+    poller = core.Poller(spotify, load_settings()["poll_seconds"])
     poller.start()
     window = LyricsWindow(poller, spotify)  # stays hidden until a song with lyrics is playing
 
-    try:
-        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, window.on_signal)
-    except Exception:
-        signal.signal(signal.SIGUSR1, signal.SIG_IGN)  # never let a stray SIGUSR1 kill the widget
-    write_pid_file()
-    atexit.register(remove_pid_file)
+    server.handler = lambda command: GLib.idle_add(window.open_settings)  # runs on the GTK thread
     if args.settings:
         GLib.idle_add(window.open_settings)
     Gtk.main()
