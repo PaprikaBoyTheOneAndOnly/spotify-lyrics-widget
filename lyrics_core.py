@@ -1,7 +1,9 @@
-"""Core logic for the Spotify lyrics widget (standard library only):
-Spotify login + now-playing polling, LRCLIB lyrics lookup, LRC parsing.
+"""Core logic for the Spotify lyrics widget (standard library only, no platform-specific code):
+Spotify login + now-playing polling, LRCLIB lyrics lookup, LRC parsing, settings, and the
+UI-neutral view model. Each platform has its own UI file that draws what `build_view` returns.
 """
 
+import argparse
 import base64
 import bisect
 import hashlib
@@ -10,6 +12,8 @@ import logging
 import os
 import re
 import secrets
+import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -19,11 +23,23 @@ import webbrowser
 from collections import namedtuple
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from xml.sax.saxutils import escape as _xml_escape
 
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "spotify-lyrics-widget"
+# The UI file of each platform calls init() with the folder it wants to keep its files in.
+# (The default only exists so that importing this module never fails.)
+CONFIG_DIR = Path.home() / ".spotify-lyrics-widget"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 TOKEN_FILE = CONFIG_DIR / "token.json"
+STATE_FILE = CONFIG_DIR / "state.json"  # remembers a Spotify "back off" across restarts
+
+
+def init(config_dir):
+    """Choose where config.json, token.json and state.json live. Call once, before anything else."""
+    global CONFIG_DIR, CONFIG_FILE, TOKEN_FILE, STATE_FILE
+    CONFIG_DIR = Path(config_dir)
+    CONFIG_FILE = CONFIG_DIR / "config.json"
+    TOKEN_FILE = CONFIG_DIR / "token.json"
+    STATE_FILE = CONFIG_DIR / "state.json"
+
 
 REDIRECT_PORT = 8888
 REDIRECT_URI = f"http://127.0.0.1:{REDIRECT_PORT}/callback"
@@ -34,8 +50,7 @@ API_URL = "https://api.spotify.com/v1"
 LRCLIB_URL = "https://lrclib.net/api"
 USER_AGENT = "spotify-lyrics-widget/1.0 (personal desktop widget)"
 
-STATE_FILE = CONFIG_DIR / "state.json"  # remembers a Spotify "back off" across restarts
-PID_FILE = CONFIG_DIR / "widget.pid"  # lets `--settings` find the running widget
+CONTROL_PORT = 8889  # a running widget listens here on 127.0.0.1 (see ControlServer)
 
 POLL_PLAYING_SECONDS = 3.0  # how often Spotify is asked while a song plays (config: poll_seconds)
 POLL_IDLE_SECONDS = 6.0  # ...while paused / nothing playing
@@ -48,7 +63,7 @@ log = logging.getLogger("lyrics")
 
 def load_json(path, default):
     try:
-        return json.loads(Path(path).read_text())
+        return json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return default
 
@@ -58,7 +73,7 @@ def save_json(path, data, private=False):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o644)
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     tmp.replace(path)
 
@@ -519,59 +534,164 @@ def update_config(**changes):
     return cfg
 
 
-def hex_to_rgb(color):
-    return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
 
 
-def build_css(s):
-    """GTK CSS for the lyrics window. Scoped by style class so it never touches other windows."""
-    r, g, b = hex_to_rgb(s["bg_color"])
-    family = f'font-family: "{s["font_family"]}";' if s["font_family"] else ""
-    return (
-        f"window.lyrics-window {{ background-image: none; background-color: rgba({r}, {g}, {b}, {s['bg_opacity']:.2f}); "
-        f"border-radius: {s['radius']}px; }}\n"
-        f"label.lyrics-text {{ color: {s['text_color']}; font-size: {s['font_size']}px; "
-        f"padding: 16px 32px; {family} }}\n"
-        f"label.lyrics-title {{ color: {s['text_color']}; font-size: 12px; opacity: 0.6; "
-        f"padding: 8px 14px; {family} }}\n"
-    )
+# --------------------------------------------------------------------------- UI-neutral view model
+
+SETUP_HELP = """
+First-time setup: you need a (free) Spotify developer app.
+  1. Go to https://developer.spotify.com/dashboard and create an app.
+  2. Add this Redirect URI:  http://127.0.0.1:8888/callback
+  3. Tick "Web API", save, then copy the Client ID from the app's settings.
+"""
+
+# Shown while the settings window is open and no song with lyrics is playing.
+SAMPLE_LINES = [(i * 1000, text) for i, text in enumerate([
+    "Earlier line", "Earlier line", "Earlier line", "Previous line",
+    "This is the current line",
+    "Next line", "Line after that", "Another line", "Another line", "Another line", "Last line",
+])]
+SAMPLE_INDEX = 4
+
+# Rows of the settings window: (key, label, kind, options); 1-tuples are section headings.
+# kinds: color, percent (stored 0..1, shown 0..100), font, spin, check
+SETTINGS_LAYOUT = [
+    ("Appearance",),
+    ("bg_color", "Background color", "color", {}),
+    ("bg_opacity", "Background opacity (%)", "percent", {"lo": 0, "hi": 100}),
+    ("text_color", "Text color", "color", {}),
+    ("font_family", "Font", "font", {}),
+    ("font_size", "Font size (px)", "spin", {"lo": 8, "hi": 72, "step": 1}),
+    ("dim_opacity", "Other lines opacity (%)", "percent", {"lo": 10, "hi": 100}),
+    ("radius", "Corner radius (px)", "spin", {"lo": 0, "hi": 60, "step": 1}),
+    ("Layout",),
+    ("width", "Width (px)", "spin", {"lo": 300, "hi": 2400, "step": 10}),
+    ("height", "Height (px)", "spin", {"lo": 80, "hi": 1200, "step": 10}),
+    ("lines_before", "Lines before current", "spin", {"lo": 0, "hi": 4, "step": 1}),
+    ("lines_after", "Lines after current", "spin", {"lo": 0, "hi": 6, "step": 1}),
+    ("keep_above", "Always on top", "check", {}),
+    ("Timing",),
+    ("poll_seconds", "Ask Spotify every (s)", "spin", {"lo": 1, "hi": 30, "step": 0.5, "digits": 1}),
+    ("offset_ms", "Lyrics timing offset (ms)", "spin", {"lo": -5000, "hi": 5000, "step": 50}),
+]
+
+# What the UI has to draw: `key` changes whenever the picture changes, `caption` is the
+# "Title - Artist" text, `rows` is a list of (text, is_current) from top to bottom.
+View = namedtuple("View", "key caption rows")
 
 
-def render_markup(lines, idx, before=1, after=2, dim=0.5):
-    """Pango markup: `before` dimmed lines, the current line (big, bold), `after` dimmed lines.
-    idx == -1 means the song has not reached its first line yet."""
-    alpha = f"{round(dim * 100)}%"
-
-    def esc(text):
-        return _xml_escape(text) if text else "♪"  # empty line -> music note
-
-    parts = [f'<span alpha="{alpha}">{esc(lines[i][1])}</span>' for i in range(max(0, idx - before), idx)]
-    current = lines[idx][1] if idx >= 0 else ""
-    parts.append(f'<span size="xx-large" weight="bold">{esc(current)}</span>')
-    parts.extend(f'<span alpha="{alpha}">{esc(text)}</span>' for _, text in lines[idx + 1: idx + 1 + after])
-    return "\n".join(parts)
-
-
-# --------------------------------------------------------------------------- running-instance helpers
-
-def write_pid_file():
-    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(str(os.getpid()))
-
-
-def remove_pid_file():
-    try:
-        if PID_FILE.read_text().strip() == str(os.getpid()):
-            PID_FILE.unlink()
-    except OSError:
-        pass
-
-
-def find_running_widget(needle=b"lyrics_widget"):
-    """PID of a running widget (from the pid file, double-checked against /proc), or None."""
-    try:
-        pid = int(PID_FILE.read_text().strip())
-        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except (OSError, ValueError):
+def build_view(snap, settings, preview=False):
+    """The view for the current moment, or None when nothing should be shown.
+    With preview=True, sample lyrics are returned when nothing is playing."""
+    idx = locate(snap, settings["offset_ms"])  # None = paused / stale / song over -> show nothing
+    if idx is not None:
+        lines, key = snap.lines, (snap.track_id, idx)
+        caption = f"{snap.title} - {snap.artist}" if snap.artist else snap.title
+    elif preview:
+        lines, idx, key = SAMPLE_LINES, SAMPLE_INDEX, ("sample", SAMPLE_INDEX)
+        caption = "Song title - Artist"
+    else:
         return None
-    return pid if needle in cmdline else None
+
+    def text(i):
+        return lines[i][1] or "♪"  # empty line -> music note
+
+    # idx == -1: the song has not reached its first line yet
+    rows = [(text(i), False) for i in range(max(0, idx - settings["lines_before"]), idx)]
+    rows.append((text(idx) if idx >= 0 else "♪", True))
+    rows.extend((text(i), False) for i in range(idx + 1, min(len(lines), idx + 1 + settings["lines_after"])))
+    return View(key, caption, rows)
+
+
+# --------------------------------------------------------------------------- start-up shared by every UI
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Spotify lyrics widget")
+    parser.add_argument("--login", action="store_true", help="(re)do the Spotify login")
+    parser.add_argument("--settings", action="store_true",
+                        help="open the settings window (in the running widget, or start one)")
+    parser.add_argument("--debug", action="store_true", help="log every Spotify poll to the terminal")
+    return parser.parse_args()
+
+
+def setup_spotify(args):
+    """Make sure there is a Client ID and a login (asking in the terminal if needed); return a Spotify."""
+    interactive = bool(sys.stdin) and sys.stdin.isatty()
+    cfg = load_json(CONFIG_FILE, {})
+    client_id = os.environ.get("SPOTIFY_CLIENT_ID") or cfg.get("client_id")
+    if not client_id:
+        if not interactive:
+            sys.exit("No Spotify Client ID yet. Run the widget once from a terminal to set it up.")
+        print(SETUP_HELP)
+        client_id = input("Paste your Spotify Client ID: ").strip()
+        if not client_id:
+            sys.exit("No Client ID given.")
+        update_config(client_id=client_id)
+
+    spotify = Spotify(client_id)
+    if args.login or not spotify.logged_in:
+        if not interactive:
+            sys.exit("Not logged in to Spotify. Run the widget once from a terminal to log in.")
+        spotify.login()
+        print("Login OK. Starting the widget (right-click it for settings or to quit, drag to move).")
+    return spotify
+
+
+# --------------------------------------------------------------------------- talking to a running widget
+
+class ControlServer(threading.Thread):
+    """Tiny line-based server on 127.0.0.1 so that `--settings` can reach the running widget.
+    It also acts as the single-instance lock: bind() fails if another widget already holds the port.
+
+    `handler(command)` is called from a server thread, so a UI must hand the work over to its own
+    main thread (GLib.idle_add, a queue polled from a timer, ...)."""
+
+    COMMANDS = ("settings",)
+
+    def __init__(self, port=CONTROL_PORT):
+        super().__init__(daemon=True)
+        self.port = port
+        self.handler = None  # set by the UI once it can act on commands
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    def bind(self):
+        try:
+            self._sock.bind(("127.0.0.1", self.port))
+            self._sock.listen(4)
+        except OSError:
+            self._sock.close()
+            return False
+        return True
+
+    def run(self):
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        with conn:
+            conn.settimeout(2)
+            try:
+                command = conn.recv(64).split(b"\n")[0].strip().decode("ascii", "ignore")
+                if command in self.COMMANDS and self.handler is not None:
+                    self.handler(command)
+                    conn.sendall(b"ok\n")
+                else:
+                    conn.sendall(b"unknown\n")
+                conn.recv(1)  # wait for the client to hang up first, so our port never lingers in TIME_WAIT
+            except OSError:
+                pass
+
+
+def send_command(command, port=CONTROL_PORT):
+    """Ask a running widget to do something. True if one answered."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1) as conn:
+            conn.settimeout(2)
+            conn.sendall(command.encode("ascii") + b"\n")
+            return conn.recv(16).strip() == b"ok"
+    except OSError:
+        return False

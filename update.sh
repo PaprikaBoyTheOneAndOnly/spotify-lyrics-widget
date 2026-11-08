@@ -7,7 +7,7 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 dest="$HOME/.local/share/spotify-lyrics-widget"
 desktop="$HOME/.config/autostart/spotify-lyrics-widget.desktop"
-files=(lyrics_core.py lyrics_widget.py)
+files=(lyrics_core.py lyrics_widget_linux.py)
 
 if [ ! -d "$dest" ]; then
     echo "The widget isn't installed yet ($dest is missing). Run ./install.sh first." >&2
@@ -26,7 +26,14 @@ for f in "${files[@]}"; do
         changed=1
     fi
 done
-chmod +x "$dest/lyrics_widget.py"
+chmod +x "$dest/lyrics_widget_linux.py"
+old="$dest/lyrics_widget.py"  # old name of lyrics_widget_linux.py: stop it, drop it, repoint autostart
+if [ -f "$old" ]; then
+    pkill -f "$old" || true
+    rm -f "$old"
+    [ -f "$desktop" ] && sed -i 's#/lyrics_widget\.py#/lyrics_widget_linux.py#' "$desktop"
+    changed=1
+fi
 
 if [ "$changed" -eq 0 ]; then
     echo "The installed widget is already up to date."
@@ -34,15 +41,15 @@ if [ "$changed" -eq 0 ]; then
 fi
 
 # Changes only take effect after a restart.
-if pgrep -f "$dest/lyrics_widget.py" >/dev/null; then
-    pkill -f "$dest/lyrics_widget.py" || true
+if pgrep -f "$dest/lyrics_widget_linux.py" >/dev/null; then
+    pkill -f "$dest/lyrics_widget_linux.py" || true
     sleep 1
     if [ -f "$desktop" ] && exec_line="$(grep -m1 '^Exec=' "$desktop" | cut -d= -f2-)" && [ -n "$exec_line" ]; then
         # same command that starts it at login (so a conda setup keeps working)
         setsid nohup bash -c "$exec_line" >/dev/null 2>&1 &
         echo "Widget restarted."
     else
-        echo "Widget stopped. Start it again with: conda activate lyrics-widget && python $dest/lyrics_widget.py &"
+        echo "Widget stopped. Start it again with: conda activate lyrics-widget && python $dest/lyrics_widget_linux.py &"
     fi
 else
     echo "The widget isn't running; the update applies the next time it starts."

@@ -1,4 +1,4 @@
-# Spotify Lyrics Widget (Ubuntu)
+# Spotify Lyrics Widget (Linux & Windows)
 
 A small borderless window that shows the lyrics of the song Spotify is currently playing, highlighting the current line
 in time with the music. It shows nothing else: when nothing is playing (or the song has no lyrics) the window hides
@@ -13,10 +13,29 @@ controls playback.
   extrapolated locally, so line changes are smooth.
 - **Lyrics:** [LRCLIB](https://lrclib.net), a free community database of time-synced lyrics. Spotify's own lyrics
   (Musixmatch) are not available through any public API, so coverage depends on LRCLIB. Obscure songs may have none.
-- **No pip packages.** Only the Python standard library plus GTK 3, provided by the conda environment described in
-  `environment.yml` (`lyrics-widget`).
+- **No pip packages.** All logic is in `lyrics_core.py` (standard library only, identical on every platform). Each
+  platform has its own UI file that only draws what the core describes:
 
-## Setup (about 3 minutes)
+  | platform | UI file                    | toolkit                                                          | config folder                       |
+  |----------|----------------------------|------------------------------------------------------------------|-------------------------------------|
+  | Linux    | `lyrics_widget_linux.py`   | GTK 3, from the conda environment in `environment.yml`           | `~/.config/spotify-lyrics-widget`   |
+  | Windows  | `lyrics_widget_windows.py` | Tkinter (ships with Python)                                      | `%APPDATA%\spotify-lyrics-widget`   |
+
+## Setup on Windows
+
+1. Install Python 3 with Tkinter (`winget install Python.Python.3.12`, or python.org; keep "tcl/tk" ticked).
+2. Create the Spotify developer app (step 2 below).
+3. In PowerShell, from this folder: `powershell -ExecutionPolicy Bypass -File .\install.ps1`
+4. Log in once with the command the script prints (`python %LOCALAPPDATA%\spotify-lyrics-widget\lyrics_widget_windows.py`),
+   then run `install.ps1` again to enable autostart. A "Lyrics Widget Settings" entry appears in the Start menu.
+5. `update.ps1` copies changed sources to the installed copy and restarts the widget.
+
+Differences on Windows: Tk cannot draw a translucent background behind opaque text, so *Background opacity* fades the
+whole window (never below 30 %), and the window is not click-through. Autostart runs `pythonw.exe` without a console;
+messages then go to `%APPDATA%\spotify-lyrics-widget\widget.log`. Everything below that mentions `lyrics_widget_linux.py`
+applies to `lyrics_widget_windows.py` on Windows.
+
+## Setup on Linux (about 3 minutes)
 
 1. **Install conda** if you don't have it (Miniconda or Miniforge). `install.sh`
    stops with instructions if it can't find conda.
@@ -33,21 +52,21 @@ controls playback.
    `~/.config/spotify-lyrics-widget/token.json`):
    ```bash
    conda activate lyrics-widget
-   python ~/.local/share/spotify-lyrics-widget/lyrics_widget.py
+   python ~/.local/share/spotify-lyrics-widget/lyrics_widget_linux.py
    ```
 5. Run `./install.sh` again to enable autostart at login.
 6. Play a song on any device. The widget appears at the bottom centre of the screen.
 
-On another Ubuntu PC: copy this folder there and repeat steps 1-5.
+On another Linux PC: copy this folder there and repeat steps 1-5.
 
 ## Using it
 
 - **Drag** with the left mouse button to move it (position is remembered).
 - **Right-click** → Settings or Quit.
-- `python lyrics_widget.py --settings` opens the settings window (in the running widget; also available as "Lyrics
+- `python lyrics_widget_linux.py --settings` opens the settings window (in the running widget; also available as "Lyrics
   Widget Settings" in the app menu, which works even while nothing is playing).
-- `python lyrics_widget.py --login` redoes the Spotify login.
-- `python lyrics_widget.py --debug` prints every Spotify poll to the terminal (useful if the widget ever seems stuck).
+- `python lyrics_widget_linux.py --login` redoes the Spotify login.
+- `python lyrics_widget_linux.py --debug` prints every Spotify poll to the terminal (useful if the widget ever seems stuck).
   (Run these inside the environment: `conda activate lyrics-widget`.)
 
 ## Start automatically on login
@@ -98,6 +117,8 @@ ones when the file is read.
   (the wait is remembered in `state.json`, so restarting doesn't make it worse). The widget also hides on its own if it
   hasn't had a fresh answer from Spotify for about 11 seconds, instead of guessing. There is no billing: Spotify's Web
   API has no pay-per-request pricing.
+- **One widget at a time:** a running widget listens on 127.0.0.1:8889 (that is how `--settings` reaches it); a second
+  start stops with a message instead of showing two windows.
 - Podcasts and ads are ignored (the widget hides).
 - Lyrics are fetched by title/artist/album/duration; remasters and live versions with a very different length are
   rejected so you don't get wrong lyrics.
